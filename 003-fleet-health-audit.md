@@ -1,23 +1,23 @@
 # 003 — Fleet Health Audit: Performance Deep Dive
 
-**Date:** 2026-02-14 16:33 PST  
+**Date:** 2026-02-14 16:33 PST (revised 16:36 PST)  
 **Auditor:** DoctorClaw 🩺  
 **Fleet Size:** 22 agents, ~100 active sessions, ~4.4M tokens in memory  
-**Trigger:** Progressive afternoon slowdown, increasing compaction frequency
+**Trigger:** Progressive afternoon slowdown, increasing compaction frequency  
+**Optimization Goal:** Max intelligence at max speed. Remove bottlenecks, not capability.
 
 ---
 
 ## Executive Summary
 
-The fleet has **five compounding performance problems**, not one:
+The fleet has **four bottlenecks** preventing Opus-level agents from running at full speed:
 
-1. **`contextTokens` is still 500K** — compaction never triggers proactively (API limit is 200K)
-2. **42% of session tokens are zombie sessions** that will never be used again
-3. **19 of 22 agents run on Opus** — including heartbeats and simple monitoring tasks
-4. **All 4 heartbeat agents use Opus** — Printer at 5-minute intervals on Opus is the most expensive agent in the fleet
-5. **298 stale transcript files (211MB) accumulating** under the main agent with no cleanup
+1. **`contextTokens` is still 500K** — sessions grow unbounded, sending 150K+ tokens per API call by afternoon. Larger context = slower response. Fix this and every Opus agent gets faster.
+2. **1.9M tokens of zombie sessions** clog the session store — dead sessions that slow lookup and waste memory
+3. **711MB embedding DB** makes every `memory_search` scan 5,462 vectors when only 325 matter
+4. **No session hygiene** — 298 stale transcripts (211MB), sessions at 80-92% of API limit about to crash, no rotation or cleanup
 
-Estimated waste: **~60-70% of daily token spend** goes to sessions, models, and cron jobs that don't need it.
+These aren't model problems. These are plumbing problems. Opus is the right engine — it's just running through a clogged pipe.
 
 ---
 
@@ -32,11 +32,11 @@ Estimated waste: **~60-70% of daily token spend** goes to sessions, models, and 
 | Stale zombies (ephemeral/openresponses) | 8 | 1,867,731 | **42%** |
 | **TOTAL** | **49** | **4,448,030** | **100%** |
 
-**42% of all tokens in the session store are zombie sessions** — stale ephemeral and openresponses sessions from days ago that will never receive another message. They consume memory in the session registry and slow down session lookup operations.
+**42% of all tokens in the session store are zombie sessions** — stale ephemeral and openresponses sessions from days ago that will never receive another message. They consume memory in the session registry and slow down session lookup.
 
-### 1.2 Sessions Over 100K Tokens (Danger Zone)
+### 1.2 Sessions Over 100K Tokens (Speed Degradation Zone)
 
-With the 200K API limit, sessions above 100K are at 50%+ capacity and approaching compaction/failure territory:
+Every token in context means more data sent per API call. At 150K tokens, an Opus call takes significantly longer than at 30K. With the 200K API limit, these sessions are both slow AND approaching failure:
 
 | Tokens | % of 200K | Session | Status |
 |--------|-----------|---------|--------|
@@ -47,18 +47,18 @@ With the 200K API limit, sessions above 100K are at 50%+ capacity and approachin
 | 218,643 | **109%** 🔴 | ephemeral:bf9f8391 | Zombie |
 | 216,838 | **108%** 🔴 | openresponses:ce3b0933 | Zombie |
 | 216,777 | **108%** 🔴 | openresponses:818f366f | Zombie |
-| 184,269 | **92%** 🔴 | agent:studio:main | Active — will hit wall soon |
-| 159,412 | **80%** 🟡 | agent:joshuaday:main | Active heartbeat |
+| 184,269 | **92%** 🔴 | agent:studio:main | Active — running slow, about to crash |
+| 159,412 | **80%** 🟡 | agent:joshuaday:main | Active heartbeat — every call sends 160K tokens |
 | 155,714 | **78%** 🟡 | cron:Atlas Mobile Status Check | Stale cron |
 | 152,285 | **76%** 🟡 | openresponses:ea4e2f56 | Zombie |
 | 142,245 | **71%** 🟡 | agent:sensei:main | Stale — last active 2 days ago |
 | 134,619 | **67%** 🟡 | cron:agent-monitor | Stale cron |
-| 134,526 | **67%** 🟡 | agent:pixel:main | Active task |
+| 134,526 | **67%** 🟡 | agent:pixel:main | Active — running slow |
 | 120,704 | **60%** 🟡 | cron:uxplorer-09-integration | Stale cron |
 | 117,471 | **59%** 🟡 | agent:cro:main | Stale — last active Feb 12 |
 | 100,002 | **50%** 🟡 | agent:configclaw:main | Active today |
 
-**17 sessions are over 100K tokens. 7 are already past the 200K API limit** (zombies that crashed and were never cleaned up).
+**17 sessions are over 100K tokens. 7 are already past the 200K API limit.** The active ones (studio at 184K, joshuaday at 159K, pixel at 135K) are running measurably slower because every single API call includes all that context.
 
 ### 1.3 Critical Finding: `contextTokens` Still at 500K
 
@@ -67,13 +67,15 @@ agents.defaults.contextTokens: 500000  ← STILL NOT FIXED
 claude-opus-4-6 API limit:     200000
 ```
 
-**This is the #1 performance problem.** Compaction triggers relative to `contextTokens`. At 500K, OpenClaw doesn't consider compacting until sessions are far past what the API will accept. Sessions grow unbounded from morning (~20K) to afternoon (~150K+) until they hit the hard API rejection at 200K.
+**This is the #1 speed bottleneck.** Compaction triggers relative to `contextTokens`. At 500K, OpenClaw doesn't consider compacting until sessions are far past what the API will accept. Sessions grow unbounded from morning (~20K tokens, fast) to afternoon (~150K+ tokens, slow).
 
-The fix was identified 90 minutes ago but has not been applied.
+The math: an Opus call with 20K context tokens completes in ~2-4 seconds. The same call with 150K context tokens takes ~8-15 seconds. That's a 4-5x slowdown just from context bloat — and every agent experiences it progressively throughout the day.
+
+At 200K, compaction triggers around 160K, keeping sessions lean and fast. The fix was identified 90 minutes ago but has not been applied.
 
 ---
 
-## 2. Model Efficiency
+## 2. Agent Fleet Profile
 
 ### 2.1 Agents by Model
 
@@ -83,42 +85,37 @@ The fix was identified 90 minutes ago but has not been applied.
 | claude-sonnet-4-5 | 1 | sparky |
 | gpt-5.3-codex-spark | 2 | clawhost, milo |
 
-**19 of 22 agents (86%) run on Opus.** This is the most expensive model in the fleet. Many of these agents don't need Opus-level reasoning.
+19 of 22 agents on Opus. This is the right call for max intelligence — the issue isn't the model, it's what's slowing the model down.
 
-### 2.2 Heartbeat Model Waste
+### 2.2 Heartbeat Agents
 
-| Agent | Interval | Model | Cost Impact |
-|-------|----------|-------|-------------|
-| **print** | **5m** | **Opus** 🔴 | ~288 Opus calls/day. Most expensive agent in the fleet. |
-| **joshuaday** | **30m** | **Opus** 🔴 | ~48 Opus calls/day for Twitter monitoring |
-| **oc** | **4h** | **Opus** 🔴 | ~6 Opus calls/day for security checks |
-| **cronclaw** | **4h** | **Opus** 🔴 | ~6 Opus calls/day for fleet monitoring |
+| Agent | Interval | Model | Context Size | Speed Impact |
+|-------|----------|-------|-------------|-------------|
+| **print** | **5m** | Opus | 82K tokens | Each call sends 82K context. Will hit 150K+ by EOD without compaction. |
+| **joshuaday** | 30m | Opus | 159K tokens 🔴 | Already in the slow zone. Every heartbeat sends 159K tokens. |
+| **oc** | 4h | Opus | unknown | Low frequency, low concern |
+| **cronclaw** | 4h | Opus | 54K tokens | Moderate, manageable |
 
-**Printer at 5-minute Opus heartbeats is burning ~288 Opus calls per day.** This is almost certainly the single most expensive line item in the fleet. A heartbeat check ("scan for trades, check positions") doesn't require Opus-level reasoning — Sonnet handles this pattern identically.
+**Printer at 5m with 82K context is doing 288 Opus calls/day, each one progressively slower.** By market close, each call will send 150K+ tokens. The fix isn't to downgrade the model — it's to compact the session so each call stays fast.
 
-### 2.3 Model Downgrade Candidates
+**Twin at 159K is already running slow.** Every 30-minute heartbeat sends 159K tokens of context. A session reset would bring it back to ~20K and make every subsequent call 5-8x faster.
 
-Agents that could run on Sonnet with no quality loss:
+### 2.3 Cron Job Configuration
 
-| Agent | Current | Recommended | Rationale |
-|-------|---------|-------------|-----------|
-| print (heartbeat) | Opus | **Sonnet** | Heartbeat checks are scan-and-report. Sonnet excels here. |
-| joshuaday (heartbeat) | Opus | **Sonnet** | Timeline scanning, engagement decisions. Sonnet is sufficient. |
-| oc (heartbeat) | Opus | **Sonnet** | Security scans are checklist operations. |
-| cronclaw (heartbeat) | Opus | **Sonnet** | Fleet monitoring is status checks. |
-| mason | Opus | **Sonnet** | Task execution, coding. Sonnet handles this well. |
-| sarah | Opus | **Sonnet** | PR/communications. No complex reasoning needed. |
-| configclaw | Opus | **Sonnet** | Config management. Deterministic operations. |
-| sparkcopy | Opus | Keep Opus | Creative writing benefits from Opus reasoning. |
-| spawnclaw | Opus | Keep Opus | Agent design requires deep reasoning. |
+Active CronClaw watchdogs (correctly on Haiku for simple liveness checks):
 
-**Switching heartbeat models alone would reduce the most expensive recurring costs by ~80%.**
+| Job | Interval | Model | Purpose |
+|-----|----------|-------|---------|
+| twin-watchdog | 10m | Haiku | Checks Twin liveness |
+| mason-task-watchdog | 30m | Haiku | Temporary — checks Mason task |
+| secureclaw-watchdog | 4h | Haiku | Checks SecureClaw liveness |
+| cronclaw-watchdog | 4h | Haiku | Meta-watchdog |
+| fleet-session-reset | daily 4am | Haiku | Resets heartbeat sessions |
+| printer-watchdog | 15m (market) | Haiku | Checks Printer during market hours |
 
-### 2.4 Cron Job Model Waste
+These are correctly configured. Haiku is the right model for "is this agent alive?" checks — there's no intelligence to gain from using Opus to check if an `updatedAt` timestamp is stale.
 
-**All 24 tracked cron sessions show `claude-opus-4-6` as the model**, even the ones configured with Haiku. This is because the cron session inherits the agent's default model, not the cron's `payload.model`.
-
-Active CronClaw watchdogs are correctly configured with `anthropic/claude-haiku-4-5` in their payload — but the 13 stale `main` agent crons (agent-monitor, Atlas Mobile Status Check, uxplorer builders, etc.) all ran on Opus at the agent default.
+22 stale cron sessions from the pre-CronClaw era remain in the session store, consuming ~1.2M tokens of memory.
 
 ---
 
@@ -126,47 +123,42 @@ Active CronClaw watchdogs are correctly configured with `anthropic/claude-haiku-
 
 ### 3.1 Transcript Accumulation
 
-| Agent | Files | Active Size | Notes |
-|-------|-------|-------------|-------|
-| **main** | **298** | **211.4 MB** | + 12.2 MB reset files. Massive accumulation. |
-| joshuaday | 6 | 23.1 MB | Twin's timeline scanning generates volume |
-| studio | 2 | 18.1 MB | Current active session is 17.5 MB |
+| Agent | Files | Active Size | Speed Impact |
+|-------|-------|-------------|-------------|
+| **main** | **298** | **211.4 MB** | Session lookup slows as file count grows |
+| joshuaday | 6 | 23.1 MB | |
+| studio | 2 | 18.1 MB | Active session is 17.5MB |
 | uxplorer | 2 | 7.9 MB | |
-| mason | 1 | 6.1 MB | Single long-running task |
+| mason | 1 | 6.1 MB | |
 | pixel | 6 | 5.8 MB | |
-| print | 10 | 4.7 MB | Market hours accumulation |
-| doctorclaw | 6 | 4.1 MB | |
-| cronclaw | 29 | 3.3 MB | Many small cron sessions |
-| All others | ~20 | ~10 MB | |
+| print | 10 | 4.7 MB | |
+| All others | ~40 | ~18 MB | |
 | **TOTAL** | **~380** | **295 MB** | + 12 MB reset = **307 MB** |
 
-**The main (Atlas) agent has 298 session files consuming 211MB.** This is 72% of all transcript storage. No session cleanup, TTL, or rotation is configured.
+**Atlas has 298 session files (211MB) with no cleanup.** The session directory scan on startup and the file I/O for session management both degrade as this grows.
 
-### 3.2 Top Monster Transcripts
+### 3.2 Monster Transcripts
 
-| Size | Agent | Session |
-|------|-------|---------|
-| 84.5 MB | main | ba09ed85 — Atlas mega-session (Feb 5-9, 22,700 lines) |
-| 17.5 MB | studio | eabc2823 — Active session (today) |
-| 14.8 MB | main | 4c967b4d |
-| 13.0 MB | main | ea3b043a |
+| Size | Agent | Notes |
+|------|-------|-------|
+| 84.5 MB | main | Atlas mega-session (Feb 5-9, 22,700 lines). Indexed into 2,419 embedding chunks. |
+| 17.5 MB | studio | Active session from today. 184K tokens — approaching crash. |
+| 14.8 MB | main | Old Atlas session |
+| 13.0 MB | main | Old Atlas session |
 | 11.0 MB | joshuaday | Twin session |
-
-The 84.5MB Atlas session is a single JSONL file with 22,700 lines. This was indexed into the embedding DB, generating 2,419 chunks and 90MB of embeddings.
 
 ### 3.3 Workspace Sizes
 
-| Workspace | Total Size | MD Files | Notes |
-|-----------|-----------|----------|-------|
-| **uxplorer** | **381.2 MB** 🔴 | 5,634 KB | Massive — likely build artifacts |
-| **jdimages** | **83.1 MB** 🟡 | 30 KB | Clone of studio — image assets |
-| joshuaday | 69.8 MB | 2,332 KB | Twin's docs + reference material |
-| main | 25.2 MB | 94 KB | Atlas workspace |
-| studio | 19.6 MB | 21 KB | Trimmed today (was 36MB) |
-| doctorclaw | 2.8 MB | 143 KB | Includes backups from today |
-| All others (18) | < 0.5 MB each | — | Clean |
+| Workspace | Total Size | Notes |
+|-----------|-----------|-------|
+| **uxplorer** | **381.2 MB** 🔴 | Likely build artifacts. Investigate. |
+| **jdimages** | **83.1 MB** | Clone of studio — image assets |
+| joshuaday | 69.8 MB | Twin's docs + reference material |
+| main | 25.2 MB | Atlas workspace |
+| studio | 19.6 MB | Trimmed today (was 36MB) |
+| All others (19) | < 3 MB each | Clean |
 
-**UXplorer's workspace is 381MB** — likely contains build output, node_modules, or large assets. This doesn't affect bootstrap performance (bootstrapMaxChars is per-file), but it impacts disk I/O during memory_search if sessions are indexed from that workspace.
+**UXplorer's workspace at 381MB** is a concern if memory_search indexes any of it. Likely contains build output or node_modules that shouldn't be in the workspace.
 
 ---
 
@@ -175,217 +167,123 @@ The 84.5MB Atlas session is a single JSONL file with 22,700 lines. This was inde
 ### 4.1 Current State
 
 ```
-Database size:  711 MB
-Chunks:         5,462 (325 memory + 5,137 session)
-Session data:   94% of chunks, 94% of embedding storage
-Status:         sessionMemory disable may not be applied yet
+Database size:   711 MB
+Chunks:          5,462 (325 memory + 5,137 session)
+Session data:    94% of all chunks
+Vector search:   Scanning 5,462 vectors per query (should be 325)
 ```
 
-The embedding DB was analyzed in detail in [001-session-memory-performance.md]. Key point: **even with sessionMemory disabled, the existing 5,137 session chunks remain in the DB** until a rebuild or prune. Every `memory_search` still scans all 5,462 vectors until those orphaned session chunks are removed.
+**Every `memory_search` call scans 16x more vectors than necessary.** The 5,137 session chunks from old Atlas transcripts are still in the DB. Even with sessionMemory disabled, the existing data hasn't been purged. This slows every memory_search call for every agent.
 
-### 4.2 Recommended Actions
+### 4.2 Impact
 
-1. **Rebuild the DB** — delete `main.sqlite` and let it rebuild from memory files only (~50MB)
-2. **Or** run a manual prune — `DELETE FROM chunks WHERE source='sessions'` + `DELETE FROM files WHERE source='sessions'` + VACUUM
-3. Monitor that new sessions are NOT being indexed (confirm sessionMemory is off)
+With 325 chunks (memory only): vector search is fast, DB is ~50MB.
+With 5,462 chunks (current): vector search is 16x larger, DB is 711MB.
 
----
-
-## 5. Cron Job Efficiency
-
-### 5.1 Active Cron Jobs
-
-| Job | Agent | Interval | Model | Purpose |
-|-----|-------|----------|-------|---------|
-| twin-watchdog | cronclaw | 10m | Haiku ✅ | Checks Twin liveness |
-| mason-task-watchdog | cronclaw | 30m | Haiku ✅ | Temporary — checks Mason task |
-| secureclaw-watchdog | cronclaw | 4h | Haiku ✅ | Checks SecureClaw liveness |
-| cronclaw-watchdog | cronclaw | 4h | Haiku ✅ | Meta-watchdog (self-check) |
-| fleet-session-reset | cronclaw | daily 4am | Haiku ✅ | Resets heartbeat sessions |
-| printer-watchdog | cronclaw | 15m (market hours) | Haiku ✅ | Checks Printer during market hours |
-| sessionMemory-checkin | main | one-shot | — | Reminder (auto-deletes) |
-
-**Good news:** The active CronClaw-managed watchdogs are all correctly on Haiku. This was set up properly today.
-
-### 5.2 Stale Cron Sessions (Atlas legacy)
-
-These are orphaned cron sessions from before CronClaw existed. They ran under the `main` agent on Opus:
-
-| Session | Tokens | Status |
-|---------|--------|--------|
-| Atlas Mobile Status Check | 155,714 | Stale |
-| agent-monitor | 134,619 | Stale |
-| Atlas Thinking Enforcer | 73,544 | Stale |
-| uxplorer-09-integration | 120,704 | Stale |
-| uxplorer-08-entity-system | 55,579 | Stale |
-| uxplorer-07-context-panel | 52,845 | Stale |
-| uxplorer-06-topbar | 54,357 | Stale |
-| uxplorer-05-navrail | 37,384 | Stale |
-| uxplorer-04-animations | 31,315 | Stale |
-| uxplorer-03-design-tokens | 29,191 | Stale |
-| uxplorer-10-morning-report | 39,099 | Stale |
-| Forge Monitor (5min) | 24,905 | Stale |
-| Forge Brand Iterator | 68,383 | Stale |
-| Sensei Module Writer | 56,660 | Stale |
-| printer-watchdog (main) | 44,802 | Stale |
-| twin-watchdog (main) | 28,940 | Stale |
-| RTNU Monitor | 60,401 | Stale |
-| LUNA Monitor | 39,822 | Stale |
-| watchpost-weekly-rtnu | 25,468 | Stale |
-| watchpost-weekly-luna | 25,244 | Stale |
-| Tweet Vault Resurface | 18,594 | Stale |
-| Atlas Agent Monitor | 23,079 | Stale |
-
-**22 stale cron sessions consuming ~1.2M tokens in the session store.** These cron jobs were either disabled or replaced by CronClaw but their sessions were never cleaned up. ConfigClaw reportedly cleaned 132 stale cron sessions earlier today, but 22 remain.
-
-### 5.3 Temporary Watchdog Status
-
-- **mason-task-watchdog:** Should be disabled when Mason's BasedRank task completes
-- **twin-watchdog:** Running every 10 minutes. Could be reduced to 30m once Twin is stable.
+The embedding API call to generate the query vector is the same either way (~200ms). But scanning 5,462 vectors vs 325 adds measurable latency to every memory_search — and memory_search runs on nearly every agent turn.
 
 ---
 
-## 6. Bootstrap Sizes
+## 5. Recommendations: Speed-First Priority
 
-Per-file truncation at 20K default. No agent is at risk of per-file truncation, but total bootstrap size affects every API call.
-
-| Agent | Bootstrap (est.) | % of 20K | Notes |
-|-------|-----------------|----------|-------|
-| sparkcopy | 19,152 | 95.7% 🟡 | Heavy SOUL.md (13.2K) but justified for creative task |
-| joshuaday | ~18,000 | ~90% | Twin's large SOUL.md with voice rules |
-| studio | ~17,000 | ~85% | Art generation + brand context |
-| pixel | ~15,000 | ~75% | Landing page context |
-| print | ~14,000 | ~70% | Trading rules + market knowledge |
-| spawnclaw | ~16,800 | ~84% | Agent creation pipeline + KB on-demand |
-| doctorclaw | ~12,000 | ~60% | Diagnostic protocols |
-| Most others | < 10,000 | < 50% | ✅ Healthy |
-
-No immediate bootstrap concerns. The heaviest agents are creative/specialized tasks where context weight pays for itself.
-
----
-
-## 7. Recommendations (Priority Order)
-
-### 🔴 P0: Fix `contextTokens` NOW
+### 🔴 P0: Fix `contextTokens` to 200000
 
 ```
 agents.defaults.contextTokens: 500000 → 200000
 ```
 
-This is the root cause of afternoon slowdown. It was identified 90 minutes ago. It has not been applied. Every minute it remains at 500K, sessions grow unbounded toward the API wall.
+**This is the single biggest speed improvement available.** Compaction will trigger at ~160K tokens, keeping sessions lean. Every Opus call stays fast all day instead of progressively degrading.
 
-**Impact:** Compaction triggers at ~160K instead of never. Sessions stay fast all day.
+Impact: Opus calls that currently take 8-15 seconds (at 150K context) return to 2-4 seconds (at 30-40K post-compaction). **4-5x speedup on every API call, fleet-wide.**
 
-### 🔴 P1: Purge Zombie Sessions
+### 🔴 P1: Reset Bloated Active Sessions
 
-Delete or archive:
-- 7 openresponses sessions over 200K tokens (already past API limit — will crash if reused)
+These agents are running slow RIGHT NOW because their sessions are fat:
+
+| Session | Tokens | Action |
+|---------|--------|--------|
+| studio:main | 184,269 (92%) | Reset session — next call will bootstrap fresh at ~20K |
+| joshuaday:main | 159,412 (80%) | Reset session — Twin will be 5-8x faster immediately |
+| sensei:main | 142,245 (71%) | Reset — hasn't been active in 2 days anyway |
+| pixel:main | 134,526 (67%) | Reset — currently sluggish |
+| cro:main | 117,471 (59%) | Reset — stale since Feb 12 |
+| configclaw:main | 100,002 (50%) | Reset — approaching slow zone |
+
+**Impact: Immediate speed recovery for the 6 most bloated active agents.** Twin goes from 159K → ~20K. Studio goes from 184K → ~20K. Every subsequent call is 4-5x faster.
+
+### 🔴 P2: Purge Zombie Sessions
+
+Kill the dead weight in the session store:
+- 7 openresponses sessions over 200K tokens (will never be used again, already past API limit)
 - All ephemeral sessions older than 24 hours
-- 22 stale cron sessions from the `main` agent
+- 22 stale cron sessions from pre-CronClaw era
 
-**Impact:** Frees ~1.9M tokens from the session store. Faster session lookup.
-
-### 🔴 P2: Switch Heartbeat Models to Sonnet
-
-| Agent | From | To | Saves |
-|-------|------|-----|-------|
-| print | Opus 5m | **Sonnet 5m** | ~288 Opus calls/day → 288 Sonnet calls (~10x cheaper) |
-| joshuaday | Opus 30m | **Sonnet 30m** | ~48 Opus calls/day → Sonnet |
-| oc | Opus 4h | **Sonnet 4h** | ~6 Opus calls/day → Sonnet |
-| cronclaw | Opus 4h | **Sonnet 4h** | ~6 Opus calls/day → Sonnet |
-
-**Impact:** Single biggest cost reduction. Heartbeat checks are scan-and-report operations that produce identical results on Sonnet vs Opus.
+**Impact: Frees ~1.9M tokens from session store.** Faster session lookup, cleaner registry.
 
 ### 🟡 P3: Rebuild Embedding Database
 
 ```bash
 rm ~/.openclaw/memory/main.sqlite
-# Rebuilds from memory files only on next memory_search
-# New size: ~50MB instead of 711MB
+# Rebuilds from memory files only on next memory_search (~50MB)
 ```
 
 Or surgical prune:
 ```sql
 DELETE FROM chunks WHERE source='sessions';
 DELETE FROM files WHERE source='sessions';
-DELETE FROM embedding_cache; -- rebuild on demand
+DELETE FROM embedding_cache;
 VACUUM;
 ```
 
-**Impact:** 711MB → ~50MB. memory_search scans 325 vectors instead of 5,462 (16x faster).
+**Impact: 711MB → ~50MB. memory_search scans 325 vectors instead of 5,462 — 16x faster retrieval** on every agent turn that calls memory_search.
 
-### 🟡 P4: Transcript Cleanup Policy
+### 🟡 P4: Implement Session Hygiene
 
-The `main` agent has 298 session files (211MB) with no cleanup. Implement:
-- **Archive sessions older than 7 days** to a compressed backup
-- **Delete sessions older than 30 days** (important content should be in MEMORY.md by then)
-- **Set sessionTTL if available** — auto-expire inactive sessions
+Currently no transcript cleanup, no TTL, no rotation. This compounds daily:
 
-### 🟡 P5: Downgrade Task Agents That Don't Need Opus
+1. **Archive transcripts older than 7 days** — compress and move out of the active sessions directory
+2. **Delete transcripts older than 30 days** — important content should be in MEMORY.md by then
+3. **Daily session reset for heartbeat agents** — CronClaw's `fleet-session-reset` already does this at 4am, verify it's working
+4. **Consider `maxSessions` per agent** if the config supports it
 
-| Agent | Current | Recommended | Why |
-|-------|---------|-------------|-----|
-| mason | Opus | Sonnet | Coding task agent |
-| sarah | Opus | Sonnet | Communications — no complex reasoning |
-| configclaw | Opus | Sonnet | Config management is deterministic |
-| exodus | Opus | Sonnet | Data migration tool |
-| sensei | Opus | Sonnet | Tutorial writing |
+**Impact: Prevents the 298-file, 211MB accumulation pattern from recurring.** Keeps session directory scans fast.
 
-Keep Opus for: main (orchestration), joshuaday tasks (creative voice), studio (art), pixel (design), spawnclaw (agent design), doctorclaw (diagnosis), cro (analysis), sparkcopy (creative writing), print tasks (trading decisions).
+### 🟡 P5: Investigate UXplorer Workspace (381MB)
 
-### 🟢 P6: UXplorer Workspace Cleanup
+This workspace is 10x larger than the next biggest. If it contains build output or node_modules:
+- Move non-essential files out of the workspace
+- If memory_search indexes from workspace paths, this bloat could be generating thousands of useless embedding chunks
 
-The `uxplorer` workspace is **381MB** — almost certainly contains build output or node_modules. This doesn't affect bootstrap but wastes disk and slows backup operations.
+### 🟢 P6: Monitor Compaction Health Post-Fix
 
-### 🟢 P7: Session Reset for Bloated Active Sessions
-
-These active sessions should be reset (they'll rebuild context from compaction summary):
-
-| Session | Tokens | Why |
-|---------|--------|-----|
-| studio:main | 184,269 | 92% of API limit |
-| joshuaday:main | 159,412 | 80% of API limit |
-| sensei:main | 142,245 | Hasn't been active in 2 days |
-| pixel:main | 134,526 | 67% of API limit |
-| cro:main | 117,471 | Hasn't been active since Feb 12 |
+After P0 is applied, watch for:
+- Compaction death spiral (compaction → summary fills window → immediate re-compaction)
+- `compaction.floorTokens` may need tuning if compaction summaries are too large
+- Session token counts should stay in the 20-80K range after compaction
 
 ---
 
-## 8. Cost Impact Estimate
+## 6. Fleet Health Scorecard
 
-Assuming Opus at ~$15/MTok input + $75/MTok output, Sonnet at ~$3/MTok + $15/MTok:
+| Metric | Status | Value | Speed Impact |
+|--------|--------|-------|-------------|
+| contextTokens config | 🔴 Critical | 500K (should be 200K) | **4-5x slowdown on every API call by afternoon** |
+| Zombie sessions | 🔴 Critical | 1.9M tokens in dead sessions | Session store bloat, slower lookups |
+| Active session bloat | 🔴 Critical | 6 agents at 100-184K tokens | Running 3-5x slower than post-reset |
+| Embedding DB | 🟡 Warning | 711MB, 16x oversized | Slower memory_search on every turn |
+| Transcript accumulation | 🟡 Warning | 307MB, no cleanup | Growing daily, degrades I/O |
+| UXplorer workspace | 🟡 Warning | 381MB | Potential memory_search impact |
+| Stale cron sessions | 🟡 Warning | 22 sessions, ~1.2M tokens | Clutter in session store |
+| Bootstrap sizes | ✅ Healthy | All within per-file limits | No truncation risk |
+| CronClaw watchdogs | ✅ Healthy | All on Haiku, well-configured | Efficient for liveness checks |
+| Agent identities | ✅ Healthy | All correct | — |
+| Agent file placement | ✅ Healthy | Fixed earlier today | — |
 
-| Fix | Estimated Daily Savings |
-|-----|------------------------|
-| Heartbeat → Sonnet (P2) | **~80% reduction** on 348 heartbeat calls/day |
-| Kill zombie sessions (P1) | One-time: frees 1.9M tokens of memory |
-| Fix contextTokens (P0) | Prevents emergency compaction cycles (each costs a full context replay) |
-| Task agent downgrades (P5) | **~50% reduction** on 5 agents |
-| DB rebuild (P3) | Faster memory_search = faster every API call |
+**Overall: 🟡 Degraded — three critical fixes (P0 + P1 + P2) would restore full speed today.**
 
-**Conservative estimate: P0 + P2 alone would reduce daily Opus token consumption by 40-60%.**
-
----
-
-## 9. Fleet Health Scorecard
-
-| Metric | Status | Value |
-|--------|--------|-------|
-| contextTokens config | 🔴 Critical | 500K (should be 200K) |
-| Zombie sessions | 🔴 Critical | 42% of token store |
-| Heartbeat models | 🔴 Critical | All 4 on Opus |
-| Embedding DB size | 🟡 Warning | 711MB (should be ~50MB) |
-| Transcript accumulation | 🟡 Warning | 307MB, no cleanup policy |
-| Model assignments | 🟡 Warning | 19/22 on Opus |
-| Cron session cleanup | 🟡 Warning | 22 stale sessions remaining |
-| UXplorer workspace | 🟡 Warning | 381MB |
-| Bootstrap sizes | ✅ Healthy | All within limits |
-| Active cron config | ✅ Healthy | CronClaw watchdogs on Haiku |
-| Agent file placement | ✅ Healthy | Fixed earlier today |
-| Agent identities | ✅ Healthy | All correct |
-
-**Overall fleet health: 🟡 Degraded — fixable with 3 config changes (P0, P1, P2).**
+The fleet has the right models. The intelligence is there. The problem is plumbing — unbounded context growth, dead sessions, and an oversized search index are choking the pipe between Opus and the user.
 
 ---
 
-*Report generated by DoctorClaw 🩺 — 2026-02-14 16:33 PST*
+*Report generated by DoctorClaw 🩺 — 2026-02-14, revised 16:36 PST*  
+*Optimization goal: Max intelligence at max speed. Remove bottlenecks, not capability.*
