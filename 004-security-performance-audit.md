@@ -1,29 +1,117 @@
-# 004 — Security × Performance Audit
+# 004 — Security × Performance Audit: Max Intelligence at Max Speed
 
 **Agent:** SecureClaw 🛡️  
 **Date:** February 14, 2026  
 **Fleet:** 22 agents, 155 sessions, macOS 26.2 (arm64), 36 GB RAM  
-**OpenClaw:** 2026.2.12 (2026.2.13 available)
+**OpenClaw:** 2026.2.12 (2026.2.13 available)  
+**Directive:** Strip away overhead, not power. Quality is non-negotiable.
 
 ---
 
 ## Executive Summary
 
-Security and performance are often treated as competing concerns. In practice, most security weaknesses in this fleet **also** waste resources — over-permissioned agents carry unnecessary context, unsandboxed execution means no resource isolation, and accumulated session data creates both a larger attack surface and slower I/O.
+This audit focuses on the intersection of security and performance through one lens: **what's making the best models run slower than they should?** Every finding is either overhead that can be stripped without reducing capability, or a security tightening that also happens to speed things up.
 
-This audit found **14 findings** at the intersection of security and performance, organized by impact.
+The single biggest performance bottleneck right now is **memory pressure** — 35 GB of 36 GB RAM used, 698 MB free. The machine is running hot. Everything that touches disk or memory under these conditions is slower than it needs to be.
 
 ---
 
-## 🔴 Critical: Tighten These First
+## 🔴 Critical: Speed Killers
 
-### 1. No Sandbox Configured — Security Gap That Also Prevents Resource Isolation
+### 1. Memory Pressure Is Severe — 698 MB Free of 36 GB
+
+**Measured:** `PhysMem: 35G used (4119M wired, 7463M compressor), 698M unused`
+
+The system is actively using 7.4 GB in compressor (macOS's in-memory swap). This means memory pages are being compressed/decompressed on every access pattern change. Every context switch, every API response landing, every file read is competing for physical memory.
+
+**What's consuming it:**
+
+| Process | RSS | Notes |
+|---|---|---|
+| Cloudflare workerd (3 procs) | 1,134 MB | agent-royale API |
+| openclaw-gateway | 486 MB | 22 agents, 155 sessions, memory search index |
+| Vite dev server (UXplorer) | 69 MB | Running since Thursday, UXplorer agent is disabled |
+| esbuild (UXplorer) | 27 MB | Same — orphaned dev tooling |
+| Next.js dev server | 79 MB | landing-page on port 3456 |
+| Total Node.js footprint | **1,829 MB** | Just the agent/dev processes |
+
+**Speed impact:** When the gateway needs to assemble a 500k-token context for an Opus call, it's fighting for memory against compressed pages. Response parsing, JSON serialization of large tool outputs, memory search index lookups — all slower under pressure.
+
+**Security relevance:** A memory-starved gateway is more likely to crash or exhibit degraded behavior. The 7.4 GB compressor usage means sensitive data (session contents, API responses) is being compressed/decompressed in memory, increasing the window where it's in an intermediate state.
+
+**Recommendations (no capability loss):**
+1. Kill the orphaned UXplorer dev server: `kill 33354 33345 33360` — frees ~165 MB. Agent is disabled, server is doing nothing.
+2. Evaluate whether all 3 workerd processes (1.1 GB) need to run concurrently
+3. If the Next.js landing page dev server isn't actively being developed, stop it — 79 MB back
+
+**Impact:** ⚡ Immediately faster gateway response assembly. 🔒 More stable gateway under load.
+
+---
+
+### 2. 711 MB SQLite Database Still on Disk After sessionMemory Disabled
+
+**Finding:** `~/.openclaw/memory/main.sqlite` is 711 MB. sessionMemory was disabled today to fix afternoon performance degradation — but the database file is still there.
+
+**Speed impact:** Even with sessionMemory disabled, this 711 MB file exists on disk. If any code path touches it (stat, open, check), it's a heavy I/O operation. More importantly, it's 711 MB that could be freed from the filesystem cache, giving the OS more room to cache files that actually matter (session transcripts, workspace files, the gateway binary itself).
+
+**Additional stale databases (62 MB total):**
+- `genghisclawn.sqlite` — 22 MB (deleted agent)
+- `god.sqlite` — 19 MB (deleted agent)
+- `tryclaw.sqlite` — 6.5 MB (deleted agent)
+- `watchpost.sqlite` — 68 KB (deleted agent)
+
+**Recommendation:**
+```bash
+# Archive then remove — recoverable if needed
+mkdir -p ~/.openclaw/memory/archive
+mv ~/.openclaw/memory/main.sqlite ~/.openclaw/memory/archive/
+mv ~/.openclaw/memory/{genghisclawn,god,tryclaw,watchpost}.sqlite ~/.openclaw/memory/archive/
+```
+
+**Impact:** ⚡ 773 MB freed from disk, better filesystem cache utilization. 🔒 Removes stale conversation embeddings.
+
+---
+
+### 3. Prompt Cache Optimization — Stable System Prompts = Faster TTFT
+
+**How Anthropic caching works:** The system prompt + injected workspace files are sent with every API call. If this prefix is identical across calls, Anthropic serves it from cache at 10x cheaper AND significantly faster (no re-processing). With `cacheRetention: "long"`, cached prefixes persist for extended periods.
+
+**What breaks cache hits:**
+- Any change to SOUL.md, AGENTS.md, TOOLS.md, USER.md, IDENTITY.md, MEMORY.md, or HEARTBEAT.md invalidates the cache for that agent
+- MEMORY.md changes on every compaction/memory flush — this is expected and unavoidable
+- But workspace file churn from other sources breaks the cache unnecessarily
+
+**Current system prompt sizes (bytes injected per call):**
+
+| Agent | Total Workspace Files | Notes |
+|---|---|---|
+| Twin (joshuaday) | 34,839 bytes | 14 KB HEARTBEAT.md alone |
+| Spark Copy | 19,152 bytes | 13 KB SOUL.md |
+| SecureClaw (oc) | 24,696 bytes | Heavy TOOLS.md + AGENTS.md |
+| Printer (print) | 25,745 bytes | 7 KB each SOUL + HEARTBEAT |
+| Mason | 21,438 bytes | |
+| Main (Atlas) | 18,212 bytes | |
+
+**Every byte in the system prompt is sent on every API call.** Larger prompts = slower time-to-first-token (TTFT), even with caching — because cache lookup time scales with prefix size.
+
+**Recommendations:**
+1. **Audit MEMORY.md volatility** — if memory flushes happen frequently, consider increasing `compaction.memoryFlush.softThresholdTokens` from 4000 to 8000. Fewer flushes = fewer cache invalidations = more cache hits.
+2. **Twin's HEARTBEAT.md is 14 KB (262 lines)** — this is a detailed X engagement playbook. It's powerful, but every byte rides along on every API call, even non-heartbeat turns. Consider whether some of the strategy notes could live in MEMORY.md (which is expected to change) rather than HEARTBEAT.md (which breaks the prompt cache when it changes).
+3. **Spark Copy's SOUL.md is 13 KB** — the largest SOUL.md in the fleet. If it's stable (doesn't change often), this is fine — it'll stay cached. If it's being iterated on, each edit breaks the cache.
+
+**Impact:** ⚡ More prompt cache hits = faster TTFT + lower cost. No capability reduction — same prompts, just more stable caching.
+
+---
+
+## 🟡 Warning: Overhead to Strip
+
+### 4. No Sandbox = No Resource Isolation Between Agents
 
 **Config:** `agents.defaults.sandbox` is empty/unconfigured.
 
-**Security impact:** Every agent runs with full host access. A compromised or hallucinating agent can read/write any file, execute any command, and access all network resources. Skills (which run unsandboxed with agent-level privileges) inherit this exposure.
+**Speed impact (the part people miss):** Without Docker sandboxing, all 22 agents share the same OS resources with zero isolation. A runaway `exec` from one agent (e.g., an agent that accidentally runs `find /` or downloads a large file) consumes CPU/memory/disk that starves every other agent. Sandboxing provides cgroup-based resource limits that prevent one agent from degrading the fleet.
 
-**Performance impact:** Without sandboxing, there's no resource isolation between agents. A runaway `exec` in one agent can consume CPU/memory that starves others. Docker sandboxing provides cgroup-based resource limits.
+**Security impact:** Every agent has full host access. A compromised or hallucinating agent can read/write any file, execute any command, access all network resources. Skills run unsandboxed with agent-level privileges.
 
 **Recommendation:**
 ```json
@@ -35,320 +123,149 @@ This audit found **14 findings** at the intersection of security and performance
   }
 }
 ```
-This sandboxes all agents except `main` (Atlas). It's the minimum viable security posture for a 22-agent fleet. Reduces blast radius AND provides resource isolation.
+Sandboxes all agents except Atlas. Agents that need host access (Twin for `xapi`, Printer for `alpaca`) would need explicit elevated permissions — which is actually better because it documents exactly who needs what.
 
-**Estimated impact:** 🔒 Major security improvement. ⚡ Prevents resource starvation from runaway agents.
-
----
-
-### 2. API Keys Stored Inline in Config — Unnecessary Exposure + Config Bloat
-
-**Finding:** `env.vars` in `openclaw.json` contains 4 plaintext API keys:
-- `OPENAI_API_KEY` (185 chars)
-- `OPENROUTER_API_KEY` (70 chars)
-- `MINIMAX_API_KEY` (93 chars)
-- `X_BEARER_TOKEN` (108 chars)
-
-Additionally, `models.providers.minimax.apiKey` duplicates the MiniMax key inline in the provider config (in addition to the `env.vars` entry).
-
-**Security impact:** Every config read, config.get API call, backup, or debug dump exposes all secrets. The `gateway config.get` API returns the full `raw` config including plaintext keys to any authenticated caller. The minimax key is stored in two places.
-
-**Performance impact:** Config is loaded into memory and passed around internally. Larger configs mean more memory per config parse. More importantly: the duplicated minimax key means two code paths resolve the same credential, adding unnecessary complexity.
-
-**Recommendation:**
-1. Move all API keys to environment variables via LaunchAgent plist or a `.env` file
-2. Remove the duplicate `models.providers.minimax.apiKey` — it should resolve from `MINIMAX_API_KEY` env var automatically
-3. Reference keys by env var name in config rather than embedding values
-
-**Estimated impact:** 🔒 Eliminates secret exposure via config reads. ⚡ Marginal config size reduction.
+**Impact:** ⚡ Resource isolation prevents agent resource starvation. 🔒 Major security improvement.
 
 ---
 
-## 🟡 Warning: Significant Savings Available
+### 5. 3.1 GB of Reclaimable Disk — Faster I/O When the SSD Has Room
 
-### 3. All Heartbeats Run on Opus ($5/$25 per Mtok) — Massive Cost Waste
+**Breakdown:**
 
-**Config:** Default heartbeat model is `anthropic/claude-opus-4-6`. All 4 active heartbeat agents use it.
-
-**The math:**
-
-| Agent | Interval | Daily Beats | Est. Tokens/Beat | Daily Token Cost |
-|---|---|---|---|---|
-| Twin (joshuaday) | 30m | 48 | ~5k (input+output) | ~240k tokens |
-| Printer (print) | 5m | 138 (weekdays) | ~5k | ~690k tokens |
-| SecureClaw (oc) | 4h | 4 | ~20k (deep scan) | ~80k tokens |
-| CronClaw (cronclaw) | 4h | 4 | ~10k | ~40k tokens |
-
-**Total:** ~1M+ tokens/day on heartbeats alone. At Opus rates ($5 input / $25 output per Mtok), that's roughly **$15-25/day just on heartbeats**.
-
-**Security relevance:** Watchdog heartbeats (twin-watchdog, printer-watchdog) are simple health checks. They don't need Opus-level reasoning. Haiku ($0.80/$4 per Mtok) handles watchdog logic fine — CronClaw's cron jobs already use Haiku for exactly this reason.
-
-**Recommendation:**
-- Set `agents.defaults.heartbeat.model` to `anthropic/claude-haiku-4-5`
-- Override to Opus only for agents that need deep reasoning in heartbeats (SecureClaw's security scans arguably benefit from Opus)
-- Twin and Printer heartbeats should absolutely be Haiku
-
-**Estimated impact:** 🔒 No security regression. ⚡ **~80-90% cost reduction on heartbeats** (~$12-22/day saved).
-
----
-
-### 4. 500k Default Context Window — Most Agents Don't Need It
-
-**Config:** `agents.defaults.contextTokens: 500000`
-
-**Finding:** All 22 agents inherit a 500k context window. Most agents (Pixel, Studio, Sensei, Exodus, CRO, Forge, Sarah, etc.) are task-specific and rarely exceed 50-100k tokens per session.
-
-**Security impact:** Larger context windows mean more data in memory per session. If a session is compromised (prompt injection), the attacker has access to a larger conversation history.
-
-**Performance impact:** Larger contexts = slower API calls (more tokens to process), higher memory usage, more expensive cache writes ($6.25/Mtok for Opus cache writes), and longer compaction cycles.
-
-**Recommendation:**
-- Set `agents.defaults.contextTokens` to `200000` (200k)
-- Override to 500k only for agents that genuinely need it (Atlas, Twin, Mason)
-- Task-specific agents (Pixel, Studio, Forge) could work with 100k
-
-**Estimated impact:** 🔒 Reduces data exposure per session. ⚡ Faster API response times, lower memory pressure, reduced cache costs.
-
----
-
-### 5. Session Transcripts Accumulating Without Cleanup — 706 MB
-
-**Finding:**
-
-| Store | Transcripts | Size |
+| Component | Size | Status |
 |---|---|---|
-| main (Atlas) | 298 | 271 MB |
-| uxplorer | 3 + archive | 125 MB |
-| studio | 2 | 70 MB |
-| pixel | 6 | 68 MB |
-| joshuaday | 6 | 28 MB |
-| **Total** | **382+** | **~600 MB** |
+| Browser profile | 1.8 GB | Chromium data — cookies, cache, ML models |
+| Quarantine | 630 MB | Dead agent data incl. 185 MB git pack |
+| UXplorer node_modules | 493 MB | `workspace-uxplorer/orchestrator-v3/` — agent is disabled |
+| Session transcripts | 271 MB (main alone) | 298 files, largest 84 MB |
+| **Total reclaimable** | **~3.1 GB** | |
 
-The largest single transcript is **84 MB** (`main/ba09ed85...`).
+**Speed impact:** SSDs perform better with free space (wear leveling, garbage collection). More importantly, the filesystem cache competes with these files. Every byte the OS caches from stale quarantine data or unused browser profiles is a byte it can't use to cache active session transcripts or workspace files.
 
-**Security impact:** Old transcripts contain full conversation histories including tool outputs, file contents, and potentially sensitive data. They persist indefinitely on disk with world-readable permissions (see finding #7).
+**Security impact:** Old browser profiles contain cookies and cached authenticated sessions. Quarantine may contain old API keys or conversation histories. 298 session transcripts in main contain full conversation histories.
 
-**Performance impact:** 
-- Disk I/O pressure from large files
-- If sessionMemory is re-enabled, these would all need indexing (recall: the 711 MB SQLite DB that caused the afternoon performance degradation was built from indexing these transcripts)
-- Compaction must read/write these files
+**Quick wins (no capability impact):**
+```bash
+# 1. Clean quarantine (630 MB)
+rm -rf ~/.openclaw/quarantine/
 
-**Recommendation:**
-1. Archive transcripts older than 7 days to compressed storage
-2. Delete transcripts older than 30 days (or move to cold storage)
-3. The 84 MB Atlas transcript should be investigated — that's abnormally large
+# 2. Clean UXplorer node_modules (493 MB) — agent is disabled
+rm -rf ~/.openclaw/workspace-uxplorer/orchestrator-v3/node_modules/
 
-**Estimated impact:** 🔒 Reduces sensitive data persistence. ⚡ Frees ~500 MB disk, prevents future sessionMemory DB bloat.
-
----
-
-### 6. Memory SQLite Databases — 983 MB Total, Growing
-
-**Finding:**
-
-| Database | Size | Agent Status |
-|---|---|---|
-| main.sqlite | 711 MB | Active |
-| uxplorer.sqlite | 63 MB | Disabled |
-| joshuaday.sqlite | 34 MB | Active |
-| genghisclawn.sqlite | 22 MB | **Deleted agent** |
-| doctorclaw.sqlite | 21 MB | Active |
-| studio.sqlite | 21 MB | Disabled |
-| god.sqlite | 19 MB | **Deleted agent** |
-| milo.sqlite | 15 MB | Active (Codex) |
-| royale.sqlite | 14 MB | Disabled |
-| architect.sqlite | 13 MB | **Deleted agent** |
-
-**Security impact:** Databases for deleted/retired agents (genghisclawn, god, architect, tryclaw, watchpost) persist with full embeddings of historical conversations. This is unnecessary data retention.
-
-**Performance impact:** `sessionMemory` was disabled specifically because `main.sqlite` at 711 MB caused performance degradation. The other databases (132 MB for deleted agents alone) consume disk for no benefit.
-
-**Recommendation:**
-1. Delete SQLite databases for retired agents: `genghisclawn.sqlite`, `god.sqlite`, `tryclaw.sqlite`, `watchpost.sqlite` (~62 MB)
-2. Consider `VACUUM` on `main.sqlite` if sessionMemory is re-enabled
-3. For disabled agents with no planned re-use, archive their databases
-
-**Estimated impact:** 🔒 Removes stale data. ⚡ Frees 60+ MB immediately, prevents confusion.
-
----
-
-### 7. Workspace Directories at 755 — Should Be 700
-
-**Finding:** All 24 workspace directories have permissions `755` (world-readable):
-```
-workspace-main: 755
-workspace-joshuaday: 755
-workspace-oc: 755
-... (all 24)
+# 3. Archive old session transcripts
+# (implement a retention policy — keep last 7 days, archive rest)
 ```
 
-Meanwhile, the parent `~/.openclaw/` is correctly `700`, and `openclaw.json` is correctly `600`.
+**Impact:** ⚡ Better filesystem cache utilization. 🔒 Removes stale sensitive data.
 
-**Security impact:** Any local user/process can read workspace contents. Workspaces contain SOUL.md, AGENTS.md, TOOLS.md, memory files, and potentially sensitive operational data. The parent directory's 700 permission mitigates this (other users can't traverse to the workspace), but defense-in-depth says the workspaces themselves should be restrictive.
+---
 
-**Performance impact:** None directly, but a compromised workspace file (e.g., via a writable TOOLS.md) could inject instructions that cause agents to perform expensive operations.
+### 6. API Keys Inline in Config — Security Risk Without Speed Benefit
 
-**Recommendation:**
+**Finding:** `env.vars` in `openclaw.json` contains 4 plaintext API keys (OPENAI_API_KEY, OPENROUTER_API_KEY, MINIMAX_API_KEY, X_BEARER_TOKEN). Additionally, `models.providers.minimax.apiKey` duplicates the MiniMax key.
+
+**Speed impact:** Minimal directly, but the duplicate MiniMax key means two resolution paths for the same credential. The config is also larger than necessary, and every `config.get` API call transfers these secrets.
+
+**Security impact:** Every config read, debug dump, or backup exposes all secrets. The `gateway config.get` API returns plaintext keys in the `raw` and `config` response fields to any authenticated caller. Secrets should live in environment variables, not config files.
+
+**Recommendation:** Move secrets to LaunchAgent environment variables or a `.env` file. Remove the duplicate `minimax.apiKey` from provider config.
+
+**Impact:** 🔒 Eliminates secret exposure via config reads. ⚡ Cleaner config resolution.
+
+---
+
+### 7. Workspace Directories at 755 — Tighten Without Cost
+
+**Finding:** All 24 workspace directories are `755` (world-readable). Should be `700`.
+
 ```bash
 chmod 700 ~/.openclaw/workspace-*
 ```
 
-**Estimated impact:** 🔒 Defense-in-depth improvement. ⚡ No performance impact.
+**Impact:** 🔒 Defense-in-depth. ⚡ Zero performance cost.
 
 ---
 
-### 8. Browser Data — 1.8 GB
+### 8. Logs Growing Without Rotation — 70 MB and Climbing
 
-**Finding:** `~/.openclaw/browser/` consumes 1.8 GB. This is the Chromium profile used for browser automation.
+**Finding:** 51 MB in `/tmp/openclaw/` (2 days), 19 MB in `~/.openclaw/logs/`. At ~25 MB/day, this grows to 750 MB/month without rotation.
 
-**Security impact:** Browser profile contains cookies, local storage, cached pages, and potentially authenticated sessions from browser automation tasks.
+**Speed impact:** Large log files mean slower log writes (append to large file), and if any process reads logs (tail, grep for debugging), it gets slower over time.
 
-**Performance impact:** 1.8 GB of disk for a feature that most agents don't use regularly. The Chromium model store alone has ML models (35 MB tflite files).
+**Recommendation:** Rotate logs weekly, keep 7 days, compress older:
+```bash
+find /tmp/openclaw -name '*.log' -mtime +7 -delete
+```
 
-**Recommendation:**
-1. Audit whether browser automation is actively needed
-2. If used rarely, clear the browser profile periodically
-3. Consider disabling `browser control: enabled` in security settings if not actively used
-
-**Estimated impact:** 🔒 Reduces cookie/session exposure. ⚡ Frees up to 1.8 GB disk.
+**Impact:** ⚡ Faster log I/O. 🔒 Limits sensitive data persistence in logs.
 
 ---
 
-### 9. Quarantine Directory — 630 MB of Deleted Agent Data
+## 🟢 Already Optimized — No Changes Needed
 
-**Finding:** `~/.openclaw/quarantine/` contains 630 MB, including data from retired agents (e.g., `ledger`). This includes a full copy of the OpenClaw source code in `.git/objects/pack/` (185 MB pack file).
+### 9. Prompt Cache Retention ✅
+`cacheRetention: "long"` on Opus and OR-Opus. This is correct — maximizes Anthropic prompt cache hits, reducing both cost (10x cheaper reads) and latency (cached prefixes are faster to process).
 
-**Security impact:** Quarantined data may contain old API keys, conversation histories, or agent configurations that should have been purged.
+### 10. Context Pruning ✅
+`cache-ttl: 30m` with `keepLastAssistants: 3`. Good balance — prevents context bloat while keeping recent conversation. Aggressive enough to keep calls fast.
 
-**Performance impact:** 630 MB of dead weight on disk.
+### 11. Compaction ✅
+`safeguard` mode with 80k reserve floor and memory flush enabled. This prevents context overflow without losing information. The memory flush writes to disk before compacting, preserving knowledge.
 
-**Recommendation:**
-1. Audit quarantine contents for sensitive data
-2. If nothing needs recovery, delete: `rm -rf ~/.openclaw/quarantine/`
-3. Or compress for archival: `tar czf quarantine-backup.tar.gz ~/.openclaw/quarantine/ && rm -rf ~/.openclaw/quarantine/`
+### 12. Network Exposure ✅
+Gateway bound to loopback. No unnecessary ports. Tailscale Serve for remote access. No Node.js processes listening on non-local interfaces. Clean.
 
-**Estimated impact:** 🔒 Removes stale sensitive data. ⚡ Frees 630 MB.
+### 13. Credential File Permissions ✅
+All auth-profiles.json at 600. All credential files at 600. Credentials directory at 700. `logging.redactSensitive: "tools"` enabled.
 
----
-
-### 10. Subagent Thinking Level Set to "high" Globally
-
-**Config:** `agents.defaults.subagents.thinking: "high"`
-
-**Finding:** Every subagent spawn uses `thinking: "high"` by default. Thinking mode significantly increases token usage (and cost) per turn. Many subagent tasks are simple lookups or delegated writes that don't benefit from extended reasoning.
-
-**Security impact:** Higher thinking levels produce more internal reasoning text, which could theoretically leak more context in error scenarios.
-
-**Performance impact:** `thinking: "high"` can 2-5x the token count per response. With `subagents.maxConcurrent: 8`, that's up to 8 simultaneous high-thinking sessions competing for API rate limits.
-
-**Recommendation:**
-- Set `agents.defaults.subagents.thinking` to `"low"` or `"medium"`
-- Let spawners override to `"high"` when the task requires it
-
-**Estimated impact:** 🔒 Reduces reasoning data exposure. ⚡ Significant token/cost reduction for subagent tasks.
+### 14. Channel Security ✅
+iMessage: `dmPolicy: "pairing"`, `groupPolicy: "allowlist"`. Slack: `groupPolicy: "allowlist"`. No open attack surface.
 
 ---
 
-### 11. Logs Growing Unbounded — 51 MB in /tmp, 19 MB in .openclaw/logs
+## The Speed Stack: What Makes Opus Respond Faster
 
-**Finding:**
-- `/tmp/openclaw/`: 51 MB (2 days of logs: 27 MB for Feb 13, 22 MB for Feb 14 so far)
-- `~/.openclaw/logs/`: 19 MB
-- No log rotation policy detected
+Understanding the latency chain helps prioritize:
 
-**Security impact:** Logs may contain partial request/response data, tool outputs, and error messages with sensitive context. `logging.redactSensitive: "tools"` is configured (good), but logs still grow unbounded.
+```
+1. Gateway assembles context     ← Memory pressure slows this (finding #1)
+2. System prompt sent to API     ← Larger prompt = slower; cache miss = much slower (finding #3)
+3. Anthropic processes request   ← We can't control this, but cache hits skip re-processing
+4. Response streams back         ← blockStreamingDefault: on holds until complete
+5. Gateway processes response    ← Memory pressure slows this (finding #1)
+6. Tool calls execute            ← No sandbox = no resource isolation (finding #4)
+7. Loop back to step 1           ← Disk I/O for transcript writes (finding #5)
+```
 
-**Performance impact:** At ~25 MB/day, logs will consume ~750 MB/month. Disk I/O for continuous logging adds overhead.
-
-**Recommendation:**
-1. Implement log rotation (keep 7 days, compress older)
-2. Set up a cron job: `find /tmp/openclaw -name '*.log' -mtime +7 -delete`
-3. The 19 MB in `~/.openclaw/logs/` may be redundant with `/tmp/openclaw/` — investigate and consolidate
-
-**Estimated impact:** 🔒 Limits sensitive data in logs. ⚡ Prevents eventual disk pressure.
-
----
-
-### 12. Agent-to-Agent Enabled Globally, No Restrictions
-
-**Config:** `tools.agentToAgent.enabled: true` with no `allowFrom` restrictions.
-
-**Finding:** Any agent can send messages to any other agent. Atlas (main) has `subagents.allowAgents` listing 21 agents, meaning it can spawn any agent as a subagent.
-
-**Security impact:** A compromised agent could message other agents to exfiltrate data or trigger actions. There's no agent-to-agent access control.
-
-**Performance impact:** Unrestricted agent-to-agent communication means any agent can trigger expensive operations on any other agent. A cascading spawn could overwhelm the fleet (mitigated somewhat by `maxConcurrent: 4`).
-
-**Recommendation:**
-- Restrict `subagents.allowAgents` per agent (most agents don't need to spawn others)
-- Currently only `main`, `uxplorer`, and `joshuaday` have `allowAgents` defined — this is good, but the default allows messaging without spawning
-
-**Estimated impact:** 🔒 Limits lateral movement. ⚡ Prevents cascade spawns.
+**The three highest-leverage changes:**
+1. **Free memory** — Kill orphaned processes, archive stale databases. The gateway is fighting for every megabyte.
+2. **Maximize prompt cache hits** — Keep workspace files stable. Every cache hit is a faster TTFT.
+3. **Enable sandboxing** — Not for restriction, but for resource isolation. One bad `exec` shouldn't slow the whole fleet.
 
 ---
 
-## 🟢 Info: Good Practices Already in Place
+## Priority Action Plan (Speed-First)
 
-### 13. Credential File Permissions — All Correct ✅
-
-| Path | Expected | Actual |
-|---|---|---|
-| `~/.openclaw/` | 700 | 700 ✅ |
-| `openclaw.json` | 600 | 600 ✅ |
-| `credentials/` | 700 | 700 ✅ |
-| All credential files | 600 | 600 ✅ |
-| All auth-profiles.json | 600 | 600 ✅ |
-
-No secrets found in workspace files (SOUL.md, TOOLS.md, AGENTS.md, USER.md, memory/).
-
-### 14. Network Exposure — Minimal ✅
-
-- Gateway bound to loopback only
-- No Node.js processes listening on non-local interfaces
-- Tailscale Serve provides remote access behind Tailscale auth
-- No unnecessary ports open
-
----
-
-## Disk Usage Summary
-
-| Component | Size | Action |
-|---|---|---|
-| Browser data | 1.8 GB | Audit/clean |
-| Memory SQLite | 983 MB | Delete retired agent DBs, VACUUM active |
-| Agent sessions | 706 MB | Archive old transcripts |
-| Quarantine | 630 MB | Delete or archive |
-| Workspaces | 790 MB | Clean UXplorer node_modules (501 MB) |
-| Logs | 70 MB | Set up rotation |
-| Media | 93 MB | Audit |
-| **Total** | **5.5 GB** | **~3 GB reclaimable** |
-
----
-
-## Priority Action Plan
-
-| # | Action | Security | Performance | Effort |
+| # | Action | Speed Impact | Security Impact | Effort |
 |---|---|---|---|---|
-| 1 | Enable sandbox mode `non-main` | 🔴 High | ⚡ Medium | Medium |
-| 2 | Switch heartbeat models to Haiku | — | ⚡ High ($) | Low |
-| 3 | Reduce default context to 200k | 🟡 Medium | ⚡ Medium | Low |
-| 4 | Move API keys to env vars | 🔴 High | ⚡ Low | Medium |
-| 5 | Set workspace dirs to 700 | 🟡 Medium | — | Low |
-| 6 | Delete retired agent SQLite DBs | 🟡 Medium | ⚡ Low | Low |
-| 7 | Archive old session transcripts | 🟡 Medium | ⚡ Medium | Medium |
-| 8 | Clean quarantine (630 MB) | 🟡 Medium | ⚡ Low | Low |
-| 9 | Set up log rotation | 🟡 Medium | ⚡ Low | Low |
-| 10 | Reduce subagent thinking default | 🟢 Low | ⚡ Medium ($) | Low |
-| 11 | Audit/clean browser data (1.8 GB) | 🟡 Medium | ⚡ Low | Low |
-| 12 | Remove minimax duplicate key | 🟢 Low | ⚡ Low | Low |
+| 1 | Kill orphaned UXplorer dev server + esbuild | ⚡⚡⚡ ~165 MB RAM freed | — | 1 min |
+| 2 | Archive main.sqlite + stale DBs | ⚡⚡ 773 MB disk freed | 🔒 Stale data removed | 2 min |
+| 3 | Clean quarantine (630 MB) | ⚡⚡ Disk + cache freed | 🔒 Old secrets removed | 1 min |
+| 4 | Clean UXplorer node_modules (493 MB) | ⚡⚡ Disk freed | — | 1 min |
+| 5 | Enable sandbox `non-main` | ⚡⚡ Resource isolation | 🔒🔒🔒 Major | Medium |
+| 6 | Increase memoryFlush threshold (4k→8k) | ⚡ Fewer cache invalidations | — | Low |
+| 7 | chmod 700 workspaces | — | 🔒 Defense-in-depth | 1 min |
+| 8 | Move API keys to env vars | ⚡ Cleaner config | 🔒🔒 Secret hygiene | Medium |
+| 9 | Set up log rotation | ⚡ Long-term I/O | 🔒 Data retention | Low |
+
+**Items 1-4 can be done in 5 minutes and free ~165 MB RAM + 1.9 GB disk.** That's the biggest immediate speed win.
 
 ---
 
 ## Key Insight
 
-**The single highest-impact change is switching heartbeat models from Opus to Haiku.** It requires zero security trade-offs and likely saves $15-25/day. The second highest is enabling sandboxing, which improves both security posture and resource isolation simultaneously.
-
-The fleet has strong fundamentals (loopback binding, token auth, correct file permissions, redacted logging). The gaps are in resource governance — too much access, too much context, too much data retention, and too-expensive models for routine tasks.
+**The fleet's power is maxed out — Opus everywhere, high thinking, 500k context, long cache retention. Good. The problem isn't the engine, it's the road.** Memory pressure, stale data competing for cache, orphaned processes eating RAM — these are the speed killers. Strip the overhead, keep the power.
 
 ---
 
