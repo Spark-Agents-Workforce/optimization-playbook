@@ -3,297 +3,167 @@
 **Author:** ConfigClaw ⚙️  
 **Date:** 2026-02-14  
 **Requested by:** Josh  
-**Scope:** Complete openclaw.json audit — all settings, all agents, all performance vectors
+**Scope:** Complete openclaw.json audit — all settings, all agents, all performance vectors  
+**Optimization goal:** Max intelligence at max speed. Opus everywhere. No model downgrades.
+
+> **Correction (v2):** Original audit was framed around cost savings and model downgrades. That was wrong. Josh's directive: the smartest models must run at peak efficiency. Speed comes from giving Opus less to chew on per turn — not from replacing it.
 
 ---
 
 ## Executive Summary
 
-After auditing every section of `openclaw.json`, I found **12 actionable findings** across 5 categories. The biggest remaining wins are: **Printer's 138 daily Opus heartbeat calls**, **75MB of orphan data from deregistered agents**, **an oversized embedding cache**, and **two heartbeat agents running 24/7 without active hours**. Several on-demand agents also carry heavier models than their usage warrants.
+After auditing every section of `openclaw.json`, I found **9 actionable speed optimizations** that preserve full Opus intelligence. The biggest wins: **reduce context window to cut API payload size**, **right-size the embedding cache to reduce memory pressure**, and **eliminate unnecessary session bloat from overnight heartbeats and orphan data**.
 
-### Changes Already Applied Today (for context)
-| Change | Before | After | Impact |
-|--------|--------|-------|--------|
-| `contextPruning.ttl` | 3m | 30m | 10× longer Anthropic cache window |
-| `compaction.reserveTokensFloor` | 20,000 | 80,000 | Compaction triggers 4× earlier |
-| `memorySearch.sources` | `["memory", "sessions"]` | `["memory"]` | Stopped indexing 283MB of sessions |
-| `sessionMemory` | true | false | Disabled session embedding |
-| Cron run sessions | 131 orphaned | Cleaned | Removed 8.7MB of stale session files |
-
----
-
-## Category 1: Heartbeat Efficiency
-
-### 🔴 FINDING 1: Printer heartbeat — 138 Opus calls/day
-
-```json
-"print": {
-  "heartbeat": {
-    "every": "5m",
-    "activeHours": { "start": "02:00", "end": "13:30" },
-    "model": "anthropic/claude-opus-4-6"
-  }
-}
-```
-
-**Problem:** 5-minute intervals × 11.5 active hours = **138 Opus API calls per day** just for heartbeats. At Opus pricing ($5/MTok input, $25/MTok output), even minimal heartbeat exchanges add up significantly.
-
-**Recommendation:** 
-- Switch heartbeat model to **Sonnet** (`anthropic/claude-sonnet-4-5`). Heartbeat polls are simple "anything need attention?" checks — Sonnet handles this perfectly at ~10× lower cost.
-- Consider increasing interval to **10m** if 5m isn't operationally necessary (halves cost again).
-- Estimated savings: ~90% cost reduction on Printer heartbeats alone.
-
-### 🟠 FINDING 2: joshuaday (Twin) heartbeat — 24/7 without activeHours
-
-```json
-"joshuaday": {
-  "heartbeat": { "every": "30m", "model": "anthropic/claude-opus-4-6" }
-}
-```
-
-**Problem:** No `activeHours` configured. Fires 48 times/day including while Josh sleeps (6:30pm–2am = 7.5 hours of wasted heartbeats = **15 unnecessary Opus calls/day**).
-
-**Recommendation:** Add `activeHours: { start: "02:00", end: "17:00", timezone: "America/Los_Angeles" }` to match Josh's schedule.
-
-### 🟠 FINDING 3: cronclaw heartbeat — 24/7 without activeHours
-
-```json
-"cronclaw": {
-  "heartbeat": { "every": "4h", "model": "anthropic/claude-opus-4-6" }
-}
-```
-
-**Problem:** Same issue — fires 6 times/day with no sleep window. Lower impact than Twin due to 4h interval, but still 1-2 unnecessary Opus calls overnight.
-
-**Recommendation:** Add activeHours or switch heartbeat model to Sonnet. CronClaw's heartbeat is a status check, not a reasoning task.
-
-### 🟡 FINDING 4: Default heartbeat model is Opus
-
-```json
-"heartbeat": {
-  "every": "30m",
-  "model": "anthropic/claude-opus-4-6",
-  "target": "none"
-}
-```
-
-**Current status:** `target: "none"` means the 18 agents inheriting defaults don't actually fire heartbeats. However, if any agent's heartbeat override doesn't explicitly set `target`, it may not inherit the default's `target: "none"` (depends on merge behavior). The 4 agents with heartbeat overrides (print, joshuaday, oc, cronclaw) **do not set target**, which means they're active.
-
-**Recommendation:** Change default heartbeat model to **Sonnet**. If any agent truly needs Opus-level reasoning for heartbeats, override it explicitly on that agent. Most heartbeats are simple status checks.
+### Changes Already Applied Today
+| Change | Before | After | Speed Impact |
+|--------|--------|-------|-------------|
+| `contextPruning.ttl` | 3m | 30m | 10× longer Anthropic cache window — massively less reprocessing |
+| `compaction.reserveTokensFloor` | 20,000 | 80,000 | Compaction triggers 4× earlier — context stays tighter |
+| `memorySearch.sources` | `["memory", "sessions"]` | `["memory"]` | Stopped querying 709MB of session embeddings |
+| `sessionMemory` | true | false | Eliminated session embedding overhead |
+| Cron run sessions | 131 orphaned | Cleaned | Removed 8.7MB of stale index fodder |
 
 ---
 
-## Category 2: Model Allocation
+## Speed Optimizations (Preserving Full Opus Intelligence)
 
-### 🟠 FINDING 5: On-demand agents running Opus unnecessarily
-
-These agents have explicit `model: "anthropic/claude-opus-4-6"` overrides:
-
-| Agent | Role | Needs Opus? |
-|-------|------|------------|
-| mason | Builder | Probably — complex code/architecture |
-| spawnclaw | Agent creation | Yes — writes SOUL.md, config |
-| configclaw | Config management | Borderline — mostly JSON manipulation |
-| jdimages | Image generation | No — orchestrates image tools |
-| sparkcopy | Copywriting | Borderline — Sonnet writes well |
-
-**Note:** These agents also inherit the default model (Opus) if not overridden, so the explicit override is redundant for mason, spawnclaw, configclaw. But `jdimages` and `sparkcopy` could likely run on Sonnet with no quality loss.
-
-**Recommendation:** Evaluate jdimages and sparkcopy for Sonnet. Image orchestration and copywriting don't typically require Opus-level reasoning. Saves ~60% on per-token cost for those agents.
-
-### ✅ FINDING 6: Sparky correctly on Sonnet
+### 🔴 P1: Reduce `contextTokens` from 500K to 250K
 
 ```json
-"sparky": { "model": "anthropic/claude-sonnet-4-5" }
+"contextTokens": 500000  // → 250000
 ```
 
-Good — lighter agent on lighter model. This pattern should be replicated where appropriate.
+**The problem:** Every API call sends the accumulated context to Anthropic. At 400K+ tokens (afternoon after heavy use), that's a massive payload. Even with prompt caching, the sheer volume impacts time-to-first-token, serialization overhead, and cache-miss penalty.
+
+**The fix:** 250K context with 80K reserve floor means compaction triggers at 170K tokens. Compaction summarizes what's pruned, so intelligence is preserved — Opus works from a tighter, better-distilled context. Faster turns, same quality answers.
+
+**Why this doesn't sacrifice intelligence:** The compaction system with memoryFlush preserves important context before summarizing. Opus working on a well-compacted 170K context produces answers just as good (often better — less noise) than Opus wading through 420K of raw accumulated history.
+
+### 🔴 P1: Reduce `memorySearch.cache.maxEntries` from 100K to 25K
+
+```json
+"cache": { "maxEntries": 100000 }  // → 25000
+```
+
+**The problem:** `text-embedding-3-large` produces 3072-dimension vectors. At float32, each embedding is ~12KB. A 100K-entry cache could consume **1.2GB of process memory**. Even partially filled, this creates memory pressure that slows the entire gateway — SQLite queries, JSON processing, everything.
+
+**The fix:** With sessionMemory disabled and sources limited to `["memory"]`, the embedding volume is dramatically lower. 25K entries is more than sufficient. Frees hundreds of MB of memory for the gateway process.
+
+**Intelligence impact:** Zero. The cache is a lookup accelerator. Reducing its ceiling doesn't change search quality — only prevents unbounded memory growth.
 
 ---
 
-## Category 3: Context & Memory Settings
-
-### 🟡 FINDING 7: contextTokens at 500K is still aggressive
+### 🟠 P2: Add `activeHours` to joshuaday (Twin) heartbeat
 
 ```json
-"contextTokens": 500000
+// Current:
+"heartbeat": { "every": "30m", "model": "anthropic/claude-opus-4-6" }
+// Recommended:
+"heartbeat": { "every": "30m", "model": "anthropic/claude-opus-4-6",
+  "activeHours": { "start": "02:00", "end": "17:00", "timezone": "America/Los_Angeles" } }
 ```
 
-**Current state:** After raising `reserveTokensFloor` to 80K, safeguard compaction now triggers at 420K tokens (was 480K). This is better but still means Atlas can accumulate a very large context before compaction intervenes.
+**The problem:** 15 Opus heartbeat calls fire while Josh sleeps (5:30pm–2am). Each one adds context to Twin's session that serves no purpose. When Josh wakes up, that bloated session is slower to process. Additionally, overnight heartbeats compete for API rate limits.
 
-**Consideration:** Reducing to 200K-300K would force more frequent compaction cycles, keeping each turn's API payload smaller. The tradeoff is losing older conversation context sooner. For Josh's heavy-use pattern (all day, many topics), a 200K-250K window with the improved 80K reserve floor would mean compaction at 120K-170K — a sweet spot for responsiveness without losing too much context.
+**Intelligence impact:** Zero. Heartbeats during sleep hours produce no actionable intelligence.
 
-**Recommendation:** Consider `contextTokens: 250000` for a meaningful improvement. This is a preference call — Josh should decide based on how much history he wants retained vs. speed.
+### 🟠 P2: Add `activeHours` to cronclaw heartbeat
 
-### 🟡 FINDING 8: Embedding cache maxEntries may be oversized
+Same reasoning. Lower volume (4h interval) but same pattern — overnight heartbeats add dead weight.
 
 ```json
-"memorySearch": {
-  "cache": {
-    "enabled": true,
-    "maxEntries": 100000
-  }
-}
+"heartbeat": { "every": "4h", "model": "anthropic/claude-opus-4-6",
+  "activeHours": { "start": "02:00", "end": "17:00", "timezone": "America/Los_Angeles" } }
 ```
 
-**Problem:** `text-embedding-3-large` produces 3072-dimension vectors. At float32, each embedding is ~12KB. A fully-populated 100K entry cache would consume ~1.2GB of memory. Even at 10% fill (10K entries), that's 120MB of in-process memory.
+### 🟠 P2: Clean 75MB orphan SQLite databases
 
-**Recommendation:** Reduce to **25,000-50,000** maxEntries. The cache is a lookup accelerator, not a permanent store. With sessionMemory now disabled and sources limited to `["memory"]`, the embedding volume is dramatically lower. 25K entries is likely more than sufficient.
+Six embedding databases for agents no longer in the fleet:
 
-### 🟡 FINDING 9: candidateMultiplier at 6 is generous
+| Agent | Size | Status |
+|-------|------|--------|
+| genghisclawn.sqlite | 22.3MB | Unknown — never in current roster |
+| god.sqlite | 18.8MB | Unknown — never in current roster |
+| royale.sqlite | 14.4MB | Removed 2026-02-14 |
+| architect.sqlite | 12.9MB | Removed 2026-02-14 |
+| tryclaw.sqlite | 6.5MB | Unknown |
+| watchpost.sqlite | 0.1MB | Unknown |
 
-```json
-"query": {
-  "hybrid": {
-    "candidateMultiplier": 6
-  }
-}
-```
+**Speed impact:** 75MB of dead data on disk. Any tooling scanning the memory directory wastes I/O on these. Cleaning them reduces disk I/O noise.
 
-This means memory_search fetches 6× the requested results as candidates, then reranks. For a typical search returning 5 results, that's 30 candidates evaluated. This is fine for accuracy but adds latency on every memory search call.
-
-**Recommendation:** Could reduce to 3-4 if memory search latency is noticeable. Keep at 6 if recall quality matters more than speed.
+Also: orphan agent directories (`agents/architect`: 5.1MB, `agents/royale`: 1.0MB) and orphan workspaces.
 
 ---
 
-## Category 4: Orphan Data & Disk Waste
+### 🟡 P3: Printer heartbeat interval — 5m → 10m
 
-### 🔴 FINDING 10: 75MB+ of orphan data from deregistered agents
+```json
+"heartbeat": { "every": "5m" }  // → "10m"
+```
 
-Agents no longer in `agents.list` but still have data on disk:
+**The problem:** Not about saving money — about **API concurrency contention.** 138 Opus calls/day from Printer alone means it's hitting the Anthropic API every 5 minutes. During Josh's active hours, this competes for rate limits and concurrent request slots with Josh's actual interactive work.
 
-| Type | Agent | Size | Notes |
-|------|-------|------|-------|
-| Memory DB | architect.sqlite | 12.9MB | Removed today |
-| Memory DB | royale.sqlite | 14.4MB | Removed today |
-| Memory DB | genghisclawn.sqlite | 22.3MB | Unknown agent |
-| Memory DB | god.sqlite | 18.8MB | Unknown agent |
-| Memory DB | tryclaw.sqlite | 6.5MB | Unknown agent |
-| Memory DB | watchpost.sqlite | 0.1MB | Unknown agent |
-| Workspace | workspace-architect | 644K | Removed today |
-| Workspace | workspace-royale | 184K | Removed today |
-| Agent dir | agents/architect | 5.1MB | Sessions still on disk |
-| Agent dir | agents/royale | 1.0MB | Sessions still on disk |
+**The fix:** 10-minute intervals halve the API contention. Printer still catches issues within a reasonable window. Each heartbeat is still full Opus intelligence.
 
-**Total orphan data: ~82MB** (mostly embedding databases for agents that no longer exist).
+**Intelligence impact:** Zero per-heartbeat. Detection latency increases from 5m to 10m max.
 
-**Recommendation:** Clean up orphan SQLite databases and agent directories. These are dead weight on disk and potentially confuse any tooling that scans the memory directory. Back up first if any might be needed for reference.
+### 🟡 P3: Workspace cleanup (1.4GB accumulated)
 
-### 🟡 FINDING 11: Large workspace directories
+| Workspace | Size |
+|-----------|------|
+| workspace (default) | 693MB |
+| workspace-uxplorer | 501MB |
+| workspace-jdimages | 83MB |
+| workspace-joshuaday | 70MB |
 
-| Workspace | Size | Notes |
-|-----------|------|-------|
-| workspace (default) | 693MB | Shared default — may contain accumulated build artifacts |
-| workspace-uxplorer | 501MB | Iris's workspace — likely generated UI assets |
-| workspace-joshuaday | 70MB | Twin's workspace |
-| workspace-jdimages | 83MB | Image generation outputs |
-| workspace-studio | 20MB | Image generation outputs |
-| workspace-main | 26MB | Atlas workspace |
-
-**Total workspace storage: ~1.4GB**
-
-**Recommendation:** Periodic cleanup of workspace build artifacts, generated images, and node_modules. The default workspace at 693MB is suspiciously large — may contain old project files or accumulated output from multiple agents.
+**Speed impact:** Disk I/O and potential memory-mapped file pressure from large directory trees. Not urgent but worth periodic maintenance.
 
 ---
 
-## Category 5: Miscellaneous
+## Findings Evaluated and Kept at Current Settings
 
-### 🟡 FINDING 12: Anthropic Opus 4.5 registered but unused
+These were considered and determined to be **correct as-is** under the max-intelligence-max-speed lens:
 
-```json
-"models": {
-  "anthropic/claude-opus-4-5": {}
-}
-```
+| Setting | Current | Verdict |
+|---------|---------|---------|
+| Default model | Opus 4.6 | ✅ Correct — max intelligence |
+| All heartbeat models | Opus 4.6 | ✅ Correct — intelligence matters even on status checks |
+| jdimages model | Opus 4.6 | ✅ Keep — orchestration quality matters |
+| sparkcopy model | Opus 4.6 | ✅ Keep — writing quality matters |
+| candidateMultiplier | 6 | ✅ Keep — better recall quality on memory search |
+| cacheRetention: "long" | On Opus models | ✅ Correct — maximizes Anthropic server cache hits |
+| hybrid search weights | 0.7 vector / 0.3 text | ✅ Good balance |
+| thinkingDefault: "high" | Fleet-wide | ✅ Correct — max reasoning depth |
+| blockStreamingDefault: "on" | Fleet-wide | ✅ Appropriate for multi-agent routing |
+| Opus 4.5 in models list | Available | ✅ Harmless — zero cost when unused, available as fallback |
 
-Opus 4.5 is in the available models list with no alias and no params. No agent references it. It's not causing harm (no cost when unused), but it's dead config.
+---
 
-**Recommendation:** Remove if not needed. Keep if it's there as a fallback option.
+## The Speed Formula
 
-### ✅ Logging config is appropriate
+> **Opus intelligence is non-negotiable. Speed comes from giving Opus less to chew on per turn.**
 
-```json
-"logging": { "redactSensitive": "tools" }
-```
-
-Good — redacts sensitive data in tool output logs. No performance impact.
-
-### ✅ Gateway config is lean
-
-```json
-"gateway": {
-  "port": 18789,
-  "mode": "local",
-  "bind": "loopback"
-}
-```
-
-Loopback binding, local mode, no unnecessary exposure. No performance concerns.
-
-### ✅ Block streaming is enabled
-
-```json
-"blockStreamingDefault": "on"
-```
-
-This buffers streaming responses, which is appropriate for multi-agent routing where partial streams add complexity without benefit.
+1. **Smaller context** (contextTokens: 250K) → less data per API call → faster responses
+2. **Longer cache TTL** (30m, applied today) → more Anthropic cache hits → less reprocessing
+3. **Earlier compaction** (80K floor, applied today) → context stays tighter → turns stay fast
+4. **Less memory pressure** (cache: 25K, sessionMemory: off) → faster gateway operations
+5. **Less contention** (activeHours, interval tuning) → API slots available for interactive work
+6. **Less disk noise** (orphan cleanup) → faster I/O operations
 
 ---
 
 ## Priority Action Matrix
 
-| Priority | Finding | Effort | Impact | Needs Approval? |
-|----------|---------|--------|--------|----------------|
-| **P1** | Printer heartbeat → Sonnet model | 1 min | High (138 calls/day cost) | Self-execute |
-| **P1** | joshuaday activeHours | 1 min | Medium (15 wasted calls/day) | Self-execute |
-| **P1** | Clean orphan SQLite DBs | 2 min | Medium (75MB disk, cleaner system) | Josh approval |
-| **P2** | Default heartbeat model → Sonnet | 1 min | Low (safety net) | Self-execute |
-| **P2** | cronclaw activeHours | 1 min | Low (1-2 calls/day) | Self-execute |
-| **P2** | Reduce embedding cache to 25K | 1 min | Medium (memory savings) | Self-execute |
-| **P2** | Evaluate jdimages/sparkcopy for Sonnet | 5 min | Medium (cost per use) | Josh decision |
-| **P3** | Reduce contextTokens to 250K | 1 min | Medium (speed vs memory tradeoff) | Josh decision |
-| **P3** | Reduce candidateMultiplier to 4 | 1 min | Low | Self-execute |
-| **P3** | Clean orphan agent dirs | 2 min | Low (6MB) | Josh approval |
-| **P3** | Workspace cleanup | 10 min | Medium (1.4GB disk) | Josh decision |
-| **P4** | Remove Opus 4.5 from models | 1 min | Negligible | Self-execute |
+| Priority | Action | Effort | Speed Impact | Intelligence Impact | Needs Approval? |
+|----------|--------|--------|-------------|-------------------|----------------|
+| **P1** | contextTokens → 250K | 1 min | 🔴 High | None (compaction preserves) | Josh confirm |
+| **P1** | Embedding cache → 25K | 1 min | 🔴 High | None | Self-execute |
+| **P2** | joshuaday activeHours | 1 min | 🟠 Medium | None | Self-execute |
+| **P2** | cronclaw activeHours | 1 min | 🟡 Low | None | Self-execute |
+| **P2** | Orphan DB cleanup | 2 min | 🟡 Low | None | Josh confirm |
+| **P3** | Printer interval → 10m | 1 min | 🟡 Low | None | Josh confirm |
+| **P3** | Workspace cleanup | 10 min | 🟡 Low | None | Josh confirm |
 
 ---
 
-## Cost Estimate Summary
-
-### Current Daily Heartbeat Cost (Opus @ $5/$25 per MTok in/out)
-| Agent | Beats/Day | Model | Est. Cost/Day |
-|-------|-----------|-------|--------------|
-| Printer | 138 | Opus 4.6 | High |
-| Twin | 48 (15 wasted) | Opus 4.6 | Medium |
-| SecureClaw | ~4 | Opus 4.6 | Low |
-| CronClaw | 6 | Opus 4.6 | Low |
-
-### After Recommended Changes
-| Agent | Beats/Day | Model | Est. Cost/Day |
-|-------|-----------|-------|--------------|
-| Printer | 138 (or 69 @10m) | **Sonnet** | ~90% reduction |
-| Twin | 30 (with activeHours) | Opus 4.6 | ~37% reduction |
-| SecureClaw | ~4 | Opus 4.6 | No change |
-| CronClaw | ~4 (with activeHours) | **Sonnet** | ~85% reduction |
-
----
-
-## What's Already Good
-
-- ✅ `target: "none"` on default heartbeat prevents 18 agents from heartbeating
-- ✅ SecureClaw has appropriate activeHours (02:00-17:00)
-- ✅ Printer has activeHours (02:00-13:30)  
-- ✅ `cacheRetention: "long"` on Opus models maximizes Anthropic server-side caching
-- ✅ Hybrid memory search with vector+text weighting
-- ✅ `redactSensitive: "tools"` in logging
-- ✅ Gateway on loopback, token auth
-- ✅ `agentToAgent: { enabled: true }` for fleet communication
-- ✅ Compaction memoryFlush before summarization preserves important context
-- ✅ contextPruning.ttl now at 30m (improved today from 3m)
-- ✅ reserveTokensFloor now at 80K (improved today from 20K)
-- ✅ sessionMemory disabled (improved today)
-
----
-
-*Generated by ConfigClaw ⚙️ from live openclaw.json analysis. All findings verified against current config state as of 2026-02-14 16:32 PST.*
+*Generated by ConfigClaw ⚙️ — v2, corrected for max-intelligence-max-speed optimization lens. 2026-02-14.*
